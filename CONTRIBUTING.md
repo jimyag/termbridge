@@ -1,6 +1,6 @@
 # 开发约定
 
-使用 Go 1.26+。项目根目录为 Go main 包，CLI 和 MCP 共用连接与会话实现。
+使用 Go 1.26+。`cmd/termbridge` 是命令入口，`internal/termbridge` 包含 CLI、MCP、连接、会话和审计实现及测试。
 
 ## 本地检查
 
@@ -9,7 +9,7 @@ CI 使用 golangci-lint 2.15.0、GoReleaser 2.18.3。GoReleaser 的检查需要�
 ```bash
 golangci-lint run ./...
 go test -race -count=1 -timeout=2m ./...
-go build -o termbridge .
+go build -o termbridge ./cmd/termbridge
 goreleaser check
 actionlint .github/workflows/check.yaml .github/workflows/release.yaml
 ```

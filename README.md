@@ -7,7 +7,7 @@
 需要 Go 1.26+，运行环境为 Linux 或 macOS。
 
 ```bash
-go build -o termbridge .
+go build -o termbridge ./cmd/termbridge
 cp termbridge.example.yaml termbridge.yaml
 chmod 600 termbridge.yaml
 ```

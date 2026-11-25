@@ -1,4 +1,4 @@
-package main
+package termbridge
 
 import (
 	"bytes"
@@ -38,8 +38,7 @@ const (
 
 func TestMain(m *testing.M) {
 	if os.Getenv(testProcess) == "1" {
-		main()
-		os.Exit(0)
+		os.Exit(Run(context.Background(), os.Args[1:], os.Stdout, os.Stderr))
 	}
 	os.Exit(m.Run())
 }

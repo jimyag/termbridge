@@ -1,4 +1,4 @@
-package main
+package termbridge
 
 import (
 	"crypto/rand"

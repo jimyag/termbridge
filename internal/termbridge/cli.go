@@ -1,4 +1,4 @@
-package main
+package termbridge
 
 import (
 	"context"
@@ -7,9 +7,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -34,15 +31,8 @@ type closeOutput struct {
 	Closed bool `json:"closed"`
 }
 
-func main() {
-	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)).With("local_uid", os.Getuid()))
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	code := runCLI(ctx, os.Args[1:], os.Stdout, os.Stderr)
-	stop()
-	os.Exit(code)
-}
-
-func runCLI(ctx context.Context, args []string, stdout, stderr io.Writer) (code int) {
+// Run executes the CLI and returns the process exit code.
+func Run(ctx context.Context, args []string, stdout, stderr io.Writer) (code int) {
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
 		if _, err := fmt.Fprintln(stdout, "Usage: termbridge <mcp|exec> [options]\n  mcp   Start the stdio MCP server\n  exec  Run a shell command"); err != nil {
 			return 1
