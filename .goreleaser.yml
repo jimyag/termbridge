@@ -1,0 +1,34 @@
+version: 2
+
+project_name: termbridge
+
+builds:
+  - id: termbridge
+    main: .
+    binary: termbridge
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - formats:
+      - binary
+    name_template: "{{ .Binary }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+release:
+  prerelease: auto
+
+changelog:
+  use: git

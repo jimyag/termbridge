@@ -1,0 +1,13 @@
+/termbridge
+/bin/
+/dist/
+/coverage.txt
+/logs/
+/termbridge.yaml
+/termbridge.json
+/.env
+/.env.*
+/.ssh/
+/known_hosts
+*.pem
+*.key

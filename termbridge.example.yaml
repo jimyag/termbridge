@@ -1,0 +1,48 @@
+logging:
+  file: ./logs/termbridge.jsonl
+connections:
+  bastion:
+    type: jumpserver
+    url: https://jump.example.com/api/v1
+    org: DEFAULT
+    access_key_id: "<AK>"
+    access_key_secret: "<SK>"
+    known_hosts: ./known_hosts
+  relay:
+    type: ssh
+    user: operator
+    via:
+      connection: bastion
+      asset: gateway
+      account: operator
+  office:
+    type: pty
+    user: operator
+    command: [remote-login]
+    via:
+      connection: relay
+      host: relay-host
+  cluster:
+    type: kubectl
+    context: operations
+    namespace: diagnostics
+    container: main
+    via:
+      connection: office
+      host: cluster-admin
+  containers:
+    type: docker
+    context: local
+    user: "1000"
+allow:
+  bastion:
+    - asset: gateway
+      account: operator
+  relay:
+    - host: relay-*
+  office:
+    - host: node-*
+  cluster:
+    - pod: app-*
+  containers:
+    - container: worker-*
