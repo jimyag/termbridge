@@ -325,10 +325,10 @@ func TestAuditCancellation(t *testing.T) {
 	}
 }
 
-func TestMCPAudit(t *testing.T) {
+func TestServiceAudit(t *testing.T) {
 	direct, known := nativeSSH(t)
 	cfg := sshFixtureConfig(direct, known)
-	cfg.Logging.File = filepath.Join(t.TempDir(), "mcp.jsonl")
+	cfg.Logging.File = filepath.Join(t.TempDir(), "service.jsonl")
 	cfg.Connections["credentials"] = connection{
 		Type:            "jumpserver",
 		URL:             "https://jump.example.com/api/v1",
@@ -340,20 +340,20 @@ func TestMCPAudit(t *testing.T) {
 		Connection: "machine",
 		Host:       "127.0.0.1",
 	})
-	result := callTool[runResult](t, client, "terminal_run", runInput{
+	result := callRPC[runResult](t, client, "run", runInput{
 		SessionID: id,
 		Command:   "printf test-access-secret",
 	})
 	if result.Output != "test-access-secret" || result.ExitCode != 0 {
-		t.Fatal("MCP result changed by audit logging")
+		t.Fatal("Service result changed by audit logging")
 	}
-	callTool[closeOutput](t, client, "terminal_close", closeInput{SessionID: id})
+	callRPC[closeOutput](t, client, "close", closeInput{SessionID: id})
 	data, err := os.ReadFile(cfg.Logging.File)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if bytes.Contains(data, []byte("test-access-secret")) {
-		t.Fatal("MCP audit disclosed configured credential")
+		t.Fatal("Service audit disclosed configured credential")
 	}
 	var recorded bool
 	for _, record := range readAudit(t, data) {
@@ -362,6 +362,6 @@ func TestMCPAudit(t *testing.T) {
 		}
 	}
 	if !recorded {
-		t.Fatal("MCP audit missing command result")
+		t.Fatal("Service audit missing command result")
 	}
 }

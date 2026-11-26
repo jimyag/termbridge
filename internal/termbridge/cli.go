@@ -2,14 +2,16 @@ package termbridge
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
 	"time"
-
-	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 type openInput = endpoint
@@ -20,7 +22,7 @@ type openOutput struct {
 
 type runInput struct {
 	SessionID string `json:"session_id"`
-	Command   string `json:"command" jsonschema:"Shell command executed with sh -c at the destination; supports multiline scripts. Maximum 32 KiB. Stdin is closed."`
+	Command   string `json:"command"`
 }
 
 type closeInput struct {
@@ -31,25 +33,36 @@ type closeOutput struct {
 	Closed bool `json:"closed"`
 }
 
+type execInput struct {
+	endpoint
+	Command string `json:"command"`
+}
+
 // Run executes the CLI and returns the process exit code.
-func Run(ctx context.Context, args []string, stdout, stderr io.Writer) (code int) {
+func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
-		if _, err := fmt.Fprintln(stdout, "Usage: termbridge <mcp|exec> [options]\n  mcp   Start the stdio MCP server\n  exec  Run a shell command"); err != nil {
+		if _, err := fmt.Fprintln(stdout, "Usage: termbridge <serve|open|run|close|exec> [options]\n  serve  Start the local terminal service\n  open   Open a persistent connection\n  run    Run a command in an open session\n  close  Close a session\n  exec   Open, run and close through the service"); err != nil {
 			return 1
 		}
 		return 0
 	}
 	mode := args[0]
-	if mode != "mcp" && mode != "exec" {
-		_, _ = fmt.Fprintf(stderr, "unknown command %q, expected mcp or exec\n", mode)
+	if mode != "serve" && mode != "open" && mode != "run" && mode != "close" && mode != "exec" {
+		_, _ = fmt.Fprintf(stderr, "unknown command %q, expected serve, open, run, close or exec\n", mode)
 		return 2
 	}
 	flags := flag.NewFlagSet("termbridge "+mode, flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	configPath := flags.String("config", "termbridge.yaml", "path to the YAML or JSON connection configuration")
-	var input openInput
-	var command string
-	if mode == "exec" {
+	socket := flags.String("socket", "", "Unix socket path (default ~/.termbridge/run.sock)")
+	var configPath, id, command string
+	var asJSON bool
+	var input endpoint
+	if mode == "serve" {
+		flags.StringVar(&configPath, "config", "termbridge.yaml", "YAML or JSON connection configuration")
+	} else {
+		flags.BoolVar(&asJSON, "json", false, "return the response as JSON, including truncation and errors")
+	}
+	if mode == "open" || mode == "exec" {
 		flags.StringVar(&input.Connection, "connection", "", "configured connection name")
 		flags.StringVar(&input.Host, "host", "", "SSH or PTY destination host")
 		flags.StringVar(&input.User, "user", "", "SSH, PTY or Docker user")
@@ -59,10 +72,15 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) (code int
 		flags.StringVar(&input.Namespace, "namespace", "", "Kubernetes namespace")
 		flags.StringVar(&input.Pod, "pod", "", "Kubernetes pod")
 		flags.StringVar(&input.Container, "container", "", "Kubernetes or Docker container")
+	}
+	if mode == "run" || mode == "close" {
+		flags.StringVar(&id, "session", "", "session ID returned by open")
+	}
+	if mode == "run" || mode == "exec" {
 		flags.StringVar(&command, "command", "", "shell command to execute at the destination")
 	}
 	if err := flags.Parse(args[1:]); err != nil {
-		if err == flag.ErrHelp {
+		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
 		return 2
@@ -71,13 +89,89 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) (code int
 		_, _ = fmt.Fprintln(stderr, "unexpected positional arguments")
 		return 2
 	}
-	if mode == "exec" {
+	if mode == "run" || mode == "exec" {
 		if err := validateCommand(command); err != nil {
 			_, _ = fmt.Fprintln(stderr, err)
 			return 2
 		}
 	}
-	cfg, err := loadConfig(*configPath)
+	if (mode == "run" || mode == "close") && id == "" {
+		_, _ = fmt.Fprintln(stderr, "session is required")
+		return 2
+	}
+	if *socket == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			_, _ = fmt.Fprintln(stderr, err)
+			return 1
+		}
+		*socket = filepath.Join(home, ".termbridge", "run.sock")
+	}
+	if mode == "serve" {
+		return runService(ctx, configPath, *socket, stderr)
+	}
+	var request any
+	switch mode {
+	case "open":
+		request = input
+	case "run":
+		request = runInput{
+			SessionID: id,
+			Command:   command,
+		}
+	case "close":
+		request = closeInput{SessionID: id}
+	case "exec":
+		request = execInput{
+			endpoint: input,
+			Command:  command,
+		}
+	}
+	client := newSocketClient(*socket)
+	defer client.http.CloseIdleConnections()
+	response, err := client.call(ctx, mode, request)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "connect to termbridge service: %v; start 'termbridge serve' with the same --socket first\n", err)
+		return 1
+	}
+	if asJSON {
+		if err := json.NewEncoder(stdout).Encode(response); err != nil {
+			return 1
+		}
+	} else if mode == "open" && response.Error == "" {
+		var opened openOutput
+		if err := json.Unmarshal(response.Data, &opened); err != nil {
+			_, _ = fmt.Fprintln(stderr, err)
+			return 1
+		}
+		if _, err := fmt.Fprintln(stdout, opened.SessionID); err != nil {
+			return 1
+		}
+	}
+	var result runResult
+	if (mode == "run" || mode == "exec") && len(response.Data) != 0 {
+		if err := json.Unmarshal(response.Data, &result); err != nil {
+			_, _ = fmt.Fprintln(stderr, err)
+			return 1
+		}
+		if !asJSON {
+			if _, err := fmt.Fprint(stdout, result.Output); err != nil {
+				return 1
+			}
+			if result.Truncated {
+				_, _ = fmt.Fprintln(stderr, "command output truncated at 32 KiB")
+			}
+		}
+	}
+	if response.Error != "" {
+		_, _ = fmt.Fprintln(stderr, response.Error)
+		return 1
+	}
+	return result.ExitCode
+}
+
+func runService(ctx context.Context, configPath, socket string, stderr io.Writer) (code int) {
+	cfg, err := loadConfig(configPath)
 	if err != nil {
 		cfg.Logging.File = ""
 		logger, _, _ := newAuditLogger(cfg, stderr)
@@ -99,7 +193,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) (code int
 		}
 		slog.SetDefault(previousLogger)
 	}()
-	serviceLogger, started := beginOperation(logger, "service.run", "mode", mode)
+	serviceLogger, started := beginOperation(logger, "service.run", "mode", "serve", "socket", socket)
 	defer func() {
 		var err error
 		if code != 0 {
@@ -115,67 +209,9 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) (code int
 	}
 	terminal := newTerminal(cfg, client)
 	defer terminal.shutdown()
-
-	if mode == "exec" {
-		id, err := terminal.open(ctx, input)
-		if err != nil {
-			return 1
-		}
-		defer terminal.close(id)
-		result, err := terminal.run(ctx, id, command)
-		if err != nil {
-			return 1
-		}
-		if _, err := fmt.Fprint(stdout, result.Output); err != nil {
-			logger.Error("command output write failed", "event", "cli.output", "error", err.Error())
-			return 1
-		}
-		if result.Truncated {
-			logger.Warn("command output truncated", "event", "cli.output", "truncated", true)
-		}
-		return result.ExitCode
-	}
-	if err := serve(ctx, terminal); err != nil && ctx.Err() == nil {
-		logger.Error("MCP server failed", "event", "service.error", "error", err.Error())
+	if err := serve(ctx, terminal, socket); err != nil {
+		logger.Error("terminal service failed", "event", "service.error", "error", err.Error())
 		return 1
 	}
 	return 0
-}
-
-func serve(ctx context.Context, terminal *terminal) error {
-	reaper, stop := context.WithCancel(ctx)
-	done := make(chan struct{})
-	go func() { defer close(done); terminal.reap(reaper) }()
-	defer func() { stop(); <-done }()
-
-	return newServer(terminal).Run(ctx, &mcp.StdioTransport{})
-}
-
-func newServer(terminal *terminal) *mcp.Server {
-	server := mcp.NewServer(&mcp.Implementation{
-		Name:    "termbridge",
-		Version: "0.1.0",
-	}, nil)
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "terminal_open",
-		Description: "Open a named connection to a permitted destination. Configured via dependencies and type-specific defaults are applied automatically.",
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, in openInput) (*mcp.CallToolResult, openOutput, error) {
-		id, err := terminal.open(ctx, in)
-		return nil, openOutput{SessionID: id}, err
-	})
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "terminal_run",
-		Description: "Execute a shell command at the destination using an open connection. Commands run in independent sh processes with closed stdin. Returns combined stdout/stderr and exit status.",
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, in runInput) (*mcp.CallToolResult, runResult, error) {
-		result, err := terminal.run(ctx, in.SessionID, in.Command)
-		return nil, result, err
-	})
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "terminal_close",
-		Description: "Close an open session and release its connection.",
-	}, func(_ context.Context, _ *mcp.CallToolRequest, in closeInput) (*mcp.CallToolResult, closeOutput, error) {
-		terminal.close(in.SessionID)
-		return nil, closeOutput{Closed: true}, nil
-	})
-	return server
 }

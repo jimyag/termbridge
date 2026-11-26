@@ -1,6 +1,6 @@
 # 开发约定
 
-使用 Go 1.26+。`cmd/termbridge` 是命令入口，`internal/termbridge` 包含 CLI、MCP、连接、会话和审计实现及测试。
+使用 Go 1.26+。`cmd/termbridge` 是命令入口，`internal/termbridge` 包含 CLI、本地 Unix socket 服务、连接、会话和审计实现及测试。
 
 ## 本地检查
 
@@ -14,7 +14,7 @@ goreleaser check
 actionlint .github/workflows/check.yaml .github/workflows/release.yaml
 ```
 
-需要验证可执行文件入口时，将 TERMBRIDGE_TEST_BIN 设置为编译产物的绝对路径，再运行测试。
+需要验证可执行文件入口时，将 TERMBRIDGE_TEST_BIN 设置为编译产物的绝对路径，再运行测试。测试会显式启动 serve，并通过 Unix socket 及独立 CLI 进程验证会话复用；临时目录必须足够短，以满足 macOS Unix socket 路径长度限制。
 
 Docker 集成测试需要设置 TERMBRIDGE_TEST_DOCKER_CONTEXT 和 TERMBRIDGE_TEST_DOCKER_CONTAINER。容器须提供 sh、uptime、df、cat、printf 和标准文本命令。CI 在 Linux runner 中创建临时 BusyBox 容器并启用该测试，macOS runner 执行其余本地测试。
 
@@ -44,7 +44,7 @@ goreleaser release --snapshot --clean
 
 ## 变更要求
 
-- 连接类型变更同步配置、授权、链路展开、CLI 和 MCP schema。
+- 连接类型变更同步配置、授权、链路展开、CLI 和本地服务请求字段。
 - 命令协议验证多行、引号、UTF-8、长行、截断、退出码、取消及连续调用。
 - 日志变更验证开始与结束的关联、未知结果、部分输出、文件权限、脱敏和并发记录。
 - 配置或接口变化同步更新 README、使用参考和配置示例。

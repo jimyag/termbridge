@@ -16,29 +16,33 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
-	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/knownhosts"
 )
 
 const (
-	testProcess = "TERMBRIDGE_TEST_STDIO"
+	testProcess = "TERMBRIDGE_TEST_CLI"
 	testBinary  = "TERMBRIDGE_TEST_BIN"
 	testKube    = "TERMBRIDGE_TEST_KUBECONFIG"
 )
 
 func TestMain(m *testing.M) {
 	if os.Getenv(testProcess) == "1" {
-		os.Exit(Run(context.Background(), os.Args[1:], os.Stdout, os.Stderr))
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		code := Run(ctx, os.Args[1:], os.Stdout, os.Stderr)
+		stop()
+		os.Exit(code)
 	}
 	os.Exit(m.Run())
 }
@@ -58,7 +62,7 @@ func sshFixtureConfig(direct step, known string) config {
 func TestSSH(t *testing.T) {
 	direct, known := nativeSSH(t)
 	client := commandClient(t, sshFixtureConfig(direct, known))
-	callFailure(t, client, "terminal_open", openInput{
+	callFailure(t, client, "open", openInput{
 		Connection: "unknown",
 		Host:       "127.0.0.1",
 	}, "unknown connection")
@@ -66,13 +70,13 @@ func TestSSH(t *testing.T) {
 		Connection: "machine",
 		Host:       "127.0.0.1",
 	})
-	callFailure(t, client, "terminal_run", runInput{
+	callFailure(t, client, "run", runInput{
 		SessionID: id,
 		Command:   "",
 	}, "command must not be empty")
 	runCommands(t, client, id)
-	callTool[closeOutput](t, client, "terminal_close", closeInput{SessionID: id})
-	callFailure(t, client, "terminal_run", runInput{
+	callRPC[closeOutput](t, client, "close", closeInput{SessionID: id})
+	callFailure(t, client, "run", runInput{
 		SessionID: id,
 		Command:   "uptime",
 	}, "closed session")
@@ -82,14 +86,10 @@ func TestCLIExec(t *testing.T) {
 	direct, known := nativeSSH(t)
 	cfg := sshFixtureConfig(direct, known)
 	cfg.Logging.File = filepath.Join(t.TempDir(), "audit.jsonl")
-	raw, err := json.Marshal(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	path := filepath.Join(t.TempDir(), "config.json")
-	writeFixture(t, path, string(raw), 0600)
+	client := commandClient(t, cfg)
 	binary := os.Getenv(testBinary)
 	if binary == "" {
+		var err error
 		binary, err = os.Executable()
 		if err != nil {
 			t.Fatal(err)
@@ -112,7 +112,7 @@ func TestCLIExec(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
-			cmd := exec.CommandContext(t.Context(), binary, append([]string{"exec", "-config", path}, tc.args...)...)
+			cmd := exec.CommandContext(t.Context(), binary, append([]string{"exec", "-socket", client.socket}, tc.args...)...)
 			cmd.Env = append(os.Environ(), testProcess+"=1")
 			cmd.Stdout, cmd.Stderr = &stdout, &stderr
 			code := 0
@@ -150,7 +150,7 @@ func TestCLIExec(t *testing.T) {
 			failedCommand = true
 		}
 	}
-	if starts == 0 || starts != finishes || !failedCommand {
+	if starts != 1 || finishes != 0 || !failedCommand {
 		t.Fatalf("CLI audit incomplete: starts=%d finishes=%d failed=%t", starts, finishes, failedCommand)
 	}
 }
@@ -160,7 +160,7 @@ func TestSSHRejectsUnknownHostKey(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "known_hosts")
 	writeFixture(t, path, "", 0600)
 	client := commandClient(t, sshFixtureConfig(direct, path))
-	callFailure(t, client, "terminal_open", openInput{
+	callFailure(t, client, "open", openInput{
 		Connection: "machine",
 		Host:       "127.0.0.1",
 	}, "before readiness")
@@ -199,7 +199,7 @@ func TestKubernetes(t *testing.T) {
 			Pod:        "termbridge-check",
 		})
 		runCommands(t, client, id)
-		callTool[closeOutput](t, client, "terminal_close", closeInput{SessionID: id})
+		callRPC[closeOutput](t, client, "close", closeInput{SessionID: id})
 	}
 }
 
@@ -233,7 +233,7 @@ func TestDocker(t *testing.T) {
 			Container:  container,
 		})
 		runCommands(t, client, id)
-		callTool[closeOutput](t, client, "terminal_close", closeInput{SessionID: id})
+		callRPC[closeOutput](t, client, "close", closeInput{SessionID: id})
 	}
 }
 func TestJumpServer(t *testing.T) {
@@ -373,27 +373,13 @@ exec sh -c "$2"
 	if err := cfg.validate(); err != nil {
 		t.Fatal(err)
 	}
-	terminal := newTerminal(cfg, api.Client())
-	t.Cleanup(terminal.shutdown)
-	serverTransport, clientTransport := mcp.NewInMemoryTransports()
-	ctx, stop := context.WithTimeout(t.Context(), 20*time.Second)
-	defer stop()
-	server, err := newServer(terminal).Connect(ctx, serverTransport, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = server.Close() }()
-	client, err := mcp.NewClient(&mcp.Implementation{Name: "verification"}, nil).Connect(ctx, clientTransport, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = client.Close() }()
+	client, _ := startTestService(t, newTerminal(cfg, api.Client()))
 
-	callFailure(t, client, "terminal_open", openInput{
+	callFailure(t, client, "open", openInput{
 		Connection: "office",
 		Host:       "root@fixture-target",
 	}, "outside")
-	callFailure(t, client, "terminal_open", openInput{
+	callFailure(t, client, "open", openInput{
 		Connection: "relay",
 		Asset:      "machine",
 	}, "outside")
@@ -403,7 +389,7 @@ exec sh -c "$2"
 	for _, input := range inputs {
 		id := openSession(t, client, input)
 		runCommands(t, client, id)
-		callTool[closeOutput](t, client, "terminal_close", closeInput{SessionID: id})
+		callRPC[closeOutput](t, client, "close", closeInput{SessionID: id})
 	}
 	if got := issued.Load(); got != wantTokens {
 		t.Fatalf("issued %d tokens, expected %d for the opened JumpServer sessions", got, wantTokens)
@@ -567,6 +553,8 @@ func runTestSSH(ctx context.Context, channel ssh.Channel, requests <-chan *ssh.R
 			return
 		}
 		cmd := exec.CommandContext(ctx, "sh", "-c", data.Command)
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
 		cmd.Env = env
 		cmd.Stdout, cmd.Stderr = channel, channel.Stderr()
 		input, err := cmd.StdinPipe()
@@ -589,7 +577,7 @@ func runTestSSH(ctx context.Context, channel ssh.Channel, requests <-chan *ssh.R
 	}
 }
 
-func commandClient(t *testing.T, cfg config) *mcp.ClientSession {
+func commandClient(t *testing.T, cfg config) *socketClient {
 	t.Helper()
 	raw, err := json.Marshal(cfg)
 	if err != nil {
@@ -604,38 +592,55 @@ func commandClient(t *testing.T, cfg config) *mcp.ClientSession {
 			t.Fatal(err)
 		}
 	}
-	cmd := exec.Command(binary, "mcp", "-config", path)
+	socket := testSocket(t)
+	cmd := exec.Command(binary, "serve", "-config", path, "-socket", socket)
 	cmd.Env = append(os.Environ(), testProcess+"=1")
 	cmd.Stderr = os.Stderr
-	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
-	defer cancel()
-	client, err := mcp.NewClient(&mcp.Implementation{Name: "verification"}, nil).Connect(ctx, &mcp.CommandTransport{Command: cmd}, nil)
-	if err != nil {
+	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = client.Close() })
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	t.Cleanup(func() {
+		_ = cmd.Process.Signal(os.Interrupt)
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("serve exit: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			_ = cmd.Process.Kill()
+			t.Errorf("serve did not stop before deadline: %v", <-done)
+		}
+		if _, err := os.Lstat(socket); !os.IsNotExist(err) {
+			t.Errorf("socket remains after serve exit: %v", err)
+		}
+	})
+	client := newSocketClient(socket)
+	t.Cleanup(client.http.CloseIdleConnections)
+	waitService(t, client, done)
 	return client
 }
 
-func openSession(t *testing.T, client *mcp.ClientSession, input openInput) string {
+func openSession(t *testing.T, client *socketClient, input openInput) string {
 	t.Helper()
-	opened := callTool[openOutput](t, client, "terminal_open", input)
+	opened := callRPC[openOutput](t, client, "open", input)
 	if opened.SessionID == "" {
 		t.Fatal("missing session ID")
 	}
 	return opened.SessionID
 }
 
-func runCommands(t *testing.T, client *mcp.ClientSession, id string) {
+func runCommands(t *testing.T, client *socketClient, id string) {
 	t.Helper()
-	load := callTool[runResult](t, client, "terminal_run", runInput{
+	load := callRPC[runResult](t, client, "run", runInput{
 		SessionID: id,
 		Command:   "uptime",
 	})
 	if load.ExitCode != 0 || !strings.Contains(load.Output, "load average") {
 		t.Fatalf("unexpected load result: %+v", load)
 	}
-	disk := callTool[runResult](t, client, "terminal_run", runInput{
+	disk := callRPC[runResult](t, client, "run", runInput{
 		SessionID: id,
 		Command:   "df -h",
 	})
@@ -670,7 +675,7 @@ func runCommands(t *testing.T, client *mcp.ClientSession, id string) {
 			output:  strings.Repeat("x", 8192),
 		},
 	} {
-		result := callTool[runResult](t, client, "terminal_run", runInput{
+		result := callRPC[runResult](t, client, "run", runInput{
 			SessionID: id,
 			Command:   tc.command,
 		})
@@ -680,47 +685,32 @@ func runCommands(t *testing.T, client *mcp.ClientSession, id string) {
 	}
 }
 
-func callTool[T any](t *testing.T, client *mcp.ClientSession, name string, input any) T {
+func callRPC[T any](t *testing.T, client *socketClient, name string, input any) T {
 	t.Helper()
 	result := call(t, client, name, input)
-	if result.IsError {
-		raw, err := json.Marshal(result.Content)
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Fatalf("%s: %s", name, raw)
+	if result.Error != "" {
+		t.Fatalf("%s: %s", name, result.Error)
 	}
 	var out T
-	raw, err := json.Marshal(result.StructuredContent)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := json.Unmarshal(raw, &out); err != nil {
+	if err := json.Unmarshal(result.Data, &out); err != nil {
 		t.Fatal(err)
 	}
 	return out
 }
 
-func callFailure(t *testing.T, client *mcp.ClientSession, name string, input any, want string) {
+func callFailure(t *testing.T, client *socketClient, name string, input any, want string) {
 	t.Helper()
 	result := call(t, client, name, input)
-	raw, err := json.Marshal(result.Content)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !result.IsError || !strings.Contains(string(raw), want) {
-		t.Fatalf("%s: expected %q, got %s", name, want, raw)
+	if !strings.Contains(result.Error, want) {
+		t.Fatalf("%s: expected %q, got %s", name, want, result.Error)
 	}
 }
 
-func call(t *testing.T, client *mcp.ClientSession, name string, input any) *mcp.CallToolResult {
+func call(t *testing.T, client *socketClient, name string, input any) rpcResponse {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
-	result, err := client.CallTool(ctx, &mcp.CallToolParams{
-		Name:      name,
-		Arguments: input,
-	})
+	result, err := client.call(ctx, name, input)
 	if err != nil {
 		t.Fatalf("%s: %v", name, err)
 	}

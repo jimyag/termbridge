@@ -27,7 +27,7 @@ type loggingConfig struct {
 }
 
 type endpoint struct {
-	Connection string `json:"connection" jsonschema:"Name of a configured connection"`
+	Connection string `json:"connection"`
 	Host       string `json:"host,omitempty"`
 	Asset      string `json:"asset,omitempty"`
 	Account    string `json:"account,omitempty"`

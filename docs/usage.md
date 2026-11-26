@@ -86,40 +86,50 @@ command 是可执行文件与固定参数组成的数组，例如 `[remote-login
 
 ## CLI
 
+启动本地服务，配置只由服务端加载。
+
 ```bash
+./termbridge serve --config termbridge.yaml
+```
+
+在另一个终端执行客户端命令。
+
+```bash
+session=$(./termbridge open --connection office --host node-1234)
+./termbridge run --session "$session" --command 'uptime'
+./termbridge run --session "$session" --command 'df -h'
+./termbridge close --session "$session"
+
 ./termbridge exec --connection office --host node-1234 --command 'ps -ef | head -20'
 ./termbridge exec --connection cluster --pod app-1 --command 'df -h'
 ./termbridge exec --connection containers --container worker-1 --command 'uname -a'
 ```
 
-支持管道、重定向和多行脚本。CLI 的 stdout 返回命令输出，stderr 输出运行日志，进程退出码对应远端命令退出码。连接、配置或协议错误返回非零状态。每次 CLI 调用结束时关闭连接。
+`open` 输出会话 ID，`run` 输出命令文本，`close` 成功时不输出文本。支持管道、重定向和多行脚本。run/exec 进程退出码对应远端命令退出码；连接或协议错误返回 1，CLI 参数错误返回 2。操作日志由 serve 写入自己的 stderr 或配置的日志文件；客户端 stderr 返回错误及截断提示。
 
-`./termbridge exec --help` 显示各连接类型可用的目的地参数。
+`exec` 在服务端建立临时会话、执行命令并关闭。`open/run/close` 则在独立 CLI 进程之间复用连接。所有客户端命令都要求 serve 已启动，不会自动启动服务。
 
-## MCP
+### Socket 与服务生命周期
 
-在支持 mcpServers 配置格式的客户端中，可以按以下方式添加 stdio 服务。路径使用实际的绝对路径。
+默认路径为 `~/.termbridge/run.sock`，所有子命令支持 `--socket`。自定义路径须在当前用户拥有的私有目录下，组和其他用户无访问权限，建议目录权限 0700。服务新建 socket 权限为 0600。已有路径和直接符号链接会被拒绝，不自动清理异常退出留下的节点。
+
+serve 前台运行，可由系统服务管理器托管；Ctrl-C 或 SIGTERM 会取消在途请求、关闭会话并移除本次创建的 socket。服务持续运行，不因没有会话而退出。配置修改后需要重启；内存中的会话不能跨服务重启恢复。确认服务已停止后才能手动删除残留 socket。
+
+### 结构化输出
+
+客户端的 `--json` 返回 `data` 和可选 `error`。open 的 data 含 session_id，close 含 closed，run/exec 含 output、exit_code、truncated。例如：
 
 ```json
-{
-  "mcpServers": {
-    "termbridge": {
-      "command": "/path/to/termbridge",
-      "args": ["mcp", "--config", "/path/to/termbridge.yaml"]
-    }
-  }
-}
+{"data":{"output":"failure","exit_code":7,"truncated":false}}
 ```
 
-| 工具 | 参数 | 返回 |
-| --- | --- | --- |
-| `terminal_open` | `{"connection":"office","host":"node-1234"}` | session_id |
-| `terminal_run` | `{"session_id":"…","command":"uname -a; uptime"}` | output、exit_code、truncated |
-| `terminal_close` | `{"session_id":"…"}` | closed |
+非零远端退出码仍是已知结果，CLI 同样以该状态退出。存在 error 时，执行结果未知或请求失败，不能使用 data 中的 exit_code 判断成功；output 可能包含中断前的部分输出。连接服务前发生的参数或传输错误仅写入 stderr，不返回 JSON 结果。
 
-同一个 session_id 可以执行多条命令，复用整条连接链。命令串行执行，每条命令在独立的 `sh -c` 进程中运行，cd 和 export 的状态不会跨调用保留。stdin 连接到 /dev/null，执行方式为非交互。stdout 与 stderr 合并返回。
+### 会话与执行限制
 
-`terminal_close` 可重复调用。服务退出时会关闭剩余会话。
+同一个会话可执行多条命令，复用整条连接链。同会话命令串行，不同会话可并行。每条命令在独立的 `sh -c` 进程中运行，cd 和 export 的状态不会跨调用保留。stdin 连接到 /dev/null，执行方式为非交互。stdout 与 stderr 合并返回。
+
+`close` 可重复调用。服务退出时会关闭剩余会话。客户端中断会取消当前请求，运行中的命令通道会关闭；已执行的远端操作不会自动撤销。
 
 | 项目 | 上限 |
 | --- | --- |
@@ -128,12 +138,13 @@ command 是可执行文件与固定参数组成的数组，例如 `[remote-login
 | 命令长度 | 32 KiB |
 | 返回输出 | 32 KiB |
 | 会话空闲 | 约 10 分钟 |
+| 客户端请求（包含排队） | 60 秒 |
 
 空命令和包含 NUL 的命令会被拒绝。超出输出上限时截断文本，truncated 为 true，连接仍可继续使用。超时、取消或缺少完成标记时关闭通道，命令结果标为未知，需要重新打开会话。远端进程的终止由对应 SSH 或容器执行环境负责。
 
 ## 操作日志
 
-正常运行时，每行日志是一个 JSON 对象，默认写入 stderr。MCP 的 stdout 用于协议通信，CLI 的 stdout 用于命令输出。
+服务端每行日志是一个 JSON 对象，默认写入 serve 的 stderr；客户端 stdout 用于会话 ID、命令输出或 JSON 结果。
 
 通过配置开启文件记录。相对路径按配置文件所在目录解析。
 
@@ -150,7 +161,8 @@ logging:
 
 | event | 记录内容 |
 | --- | --- |
-| `service.run` | CLI 或 MCP 启动、退出状态与运行时长 |
+| `service.run` | serve 启动、退出状态与运行时长 |
+| `service.ready` | 本地 socket 已准备好接收客户端请求 |
 | `terminal.open` | 请求目的地、展开后的链路、建立结果与会话 ID |
 | `terminal.run` | 命令、输出、退出码、截断标志、耗时及失败原因 |
 | `terminal.close` | 显式关闭、空闲回收、连接失效回收或服务退出时的关闭 |
